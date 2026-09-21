@@ -43,3 +43,53 @@ The assessment states current monitoring only checks uptime, with no alerting on
 | 2 | ALB `TargetResponseTime` (p95) | > 1000ms | 5 min, 3 consecutive periods | Catches degradation (DB pool exhaustion, Redis contention, undersized task) before it becomes outright errors. |
 | 3 | Job queue backlog — Redis `LLEN` on the job queue, published as a custom CloudWatch metric (ElastiCache has no native queue-depth metric) | > 500 pending jobs | 5 min, 3 consecutive periods | Signals the worker has stalled or can't keep up; since Redis also serves as the cache, an unbounded backlog risks memory pressure on the same node. |
 
+## Cost Optimization Proposal
+
+Baseline is the assessment's supplied AWS total only — **£1,415/month**, which already sums exactly from the 10 line items below. This excludes the separately-mentioned £900/month LLM API cost; that is not AWS spend and is not part of this analysis. Target: <£45/customer × 20 customers = **£900/month**, i.e. a cut of **at least £515/month**. No current AWS unit prices are assumed anywhere below — every saving is a **percentage reduction against the supplied line item**, not a computed AWS rate.
+
+### Savings by line item
+
+| Item | Current | Measured fact used | Proposed action | Est. saving | New cost |
+|---|---|---|---|---|---|
+| Staging | £260 | Full production copy, running 24/7 | Schedule down outside business hours (~09:00–19:00 Mon–Fri only) | ~£155 (60%) | £105 |
+| Workers Fargate | £190 | Queue empty 70% of the time | Queue-depth autoscaling, **min 1 replica always warm** (not scale-to-zero) | ~£75 (40%) | £115 |
+| API Fargate | £210 | Avg 12% CPU | Replica-count autoscaling on load (not shrinking task size yet) | ~£55 (26%) | £155 |
+| CloudWatch Logs | £95 | DEBUG level; logs never expire | Drop to INFO/WARN in prod; set 30–90 day retention | ~£50 (53%) | £45 |
+| Redis | £150 | 8% memory used | Right-size **one** node tier down, only after confirming peak (not just current) memory/throughput | ~£50 (33%) | £100 |
+| NAT Gateways | £140 | *(no direct measurement — general infra cost)* | VPC endpoints for ECR/S3/CloudWatch Logs/Secrets Manager to cut data processed through NAT | ~£40 (29%) | £100 |
+| Admin EC2 | £55 | Used only office hours | Schedule stop/start (~09:00–18:00 Mon–Fri) | ~£35 (64%) | £20 |
+| Frontend Fargate | £105 | Traffic 10–15% of peak nights/weekends | Same replica autoscaling approach as API | ~£25 (24%) | £80 |
+| Vector DB EC2 | £130 | *(no utilization data supplied)* | **No instance right-sizing this round** — commit to a compute Savings Plan only, given an implied steady 24/7 workload | ~£20 (illustrative commitment discount, not a claimed AWS rate) | £110 |
+| ALB/CloudFront/S3/ECR | £80 | ~400 old ECR images | ECR lifecycle policy (expire untagged, keep last N tagged); ALB/CloudFront/S3 left unchanged — no waste signal | ~£15 (low confidence) | £65 |
+
+**Highest-value savings:** staging scheduling (£155), worker autoscaling (£75), and API autoscaling (£55) together account for £285 — over half of the total reduction — and are also the three items backed by the strongest measured facts (24/7 idle copy, 70%-empty queue, 12% CPU).
+
+### Risks and mitigations
+
+- **Staging:** blocks devs needing it outside scheduled hours → on-demand manual start (workflow trigger) for exceptions.
+- **Workers:** a burst after idle could lag before scale-up → keep 1 warm replica, short scale-up cooldown on queue length.
+- **API/Frontend:** average CPU hides peak bursts → scale on p95/target-tracking (not average), keep the existing HA floor (≥2 replicas) for zero-downtime deploys.
+- **CloudWatch Logs:** losing DEBUG detail during an incident → keep a temporary log-level override (env var) for active debugging, not permanently on.
+- **Redis:** it's both cache and queue broker — undersizing risks eviction storms or write throttling under burst → validate against 2+ weeks of peak (not current) usage before resizing; keep headroom.
+- **NAT:** none to reliability — endpoint policies add minor operational surface only.
+- **Admin EC2:** blocks after-hours emergency access → manual start runbook for rare out-of-hours need.
+- **Vector DB:** 1-year Savings Plan commitment reduces flexibility if load later drops → choose the shortest viable term; commit only up to the confirmed minimum baseline once measured.
+- **ECR lifecycle:** could delete an image a live/rollback task definition still references → retention rule always keeps the last N (e.g. 20–30) tagged builds and never touches images referenced by an active task definition.
+
+### Reconciliation
+
+- Total estimated savings: **£520/month**
+- Projected AWS total: £1,415 − £520 = **£895/month**
+- Projected cost/customer: £895 ÷ 20 = **£44.75/customer/month** — under the £45 target, with a small £5/month margin against the required £515 cut.
+
+### What we are deliberately **not** cutting
+
+**NAT Gateway redundancy (one per AZ).** Collapsing to a single shared NAT Gateway would save only a small slice of the £140 line (the per-gateway hourly charge) but creates a single point of failure for all private-subnet egress — ECR pulls, external PostgreSQL calls, Secrets Manager reads — in that AZ. The target is already reachable without this cut, so the reliability trade-off isn't justified.
+
+### Detecting a future cost spike
+
+- **AWS Budgets** with a monthly threshold alert (e.g. at 80% and 100% of the £900 target) and a forecasted-spend alert.
+- **AWS Cost Anomaly Detection** per service, to catch unexpected jumps (e.g. a stuck autoscaling policy) faster than a monthly budget review would.
+- Consistent **cost-allocation tags** (service, environment) so Cost Explorer can attribute a spike to a specific line item within hours, not at month-end.
+- Cross-reference with the operational alarms above: a sustained queue-backlog or latency alarm firing often correlates with autoscaling stuck at max capacity — i.e., an operational alarm is frequently the earliest signal of a cost spike, not the bill itself.
+
