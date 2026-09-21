@@ -1,4 +1,4 @@
-fastapi
-uvicorn
-psycopg2-binary
-redis
+fastapi==0.141.1
+uvicorn==0.53.0
+psycopg2-binary==2.9.13
+redis==8.1.0
