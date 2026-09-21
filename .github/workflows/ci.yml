@@ -2,6 +2,9 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -37,3 +40,85 @@ jobs:
       - name: Clean up docker-compose stack
         if: always()
         run: docker compose down -v --remove-orphans
+
+  deploy:
+    name: Deploy to ECS
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      
+      - name: Check deployment configuration
+        id: config
+        run: |
+          if [ -z "$AWS_REGION" ] || [ -z "$AWS_DEPLOY_ROLE_ARN" ] || [ -z "$ECR_REPOSITORY" ] || [ -z "$ECS_CLUSTER" ] || [ -z "$ECS_SERVICE" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip deployment (no AWS configuration present)
+        if: steps.config.outputs.configured != 'true'
+        run: |
+          echo "AWS_REGION, AWS_DEPLOY_ROLE_ARN, ECR_REPOSITORY, ECS_CLUSTER or ECS_SERVICE is not set."
+          echo "Skipping - nothing was deployed, no AWS calls were made."
+          echo "Fill in the repo variables once the AWS account/role/cluster/service exist."
+
+      
+      - name: Configure AWS credentials (OIDC)
+        if: steps.config.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: steps.config.outputs.configured == 'true'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image to ECR
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          IMAGE_SHA="${REGISTRY}/${ECR_REPOSITORY}:${{ github.sha }}"
+          IMAGE_LATEST="${REGISTRY}/${ECR_REPOSITORY}:latest"
+          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+
+      - name: Deploy new image to ECS service
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          # Assumes the ECS task definition already exists (provisioned
+          # outside this repo, no Terraform/CDK here) and points at :latest
+          # in this ECR repo. --force-new-deployment makes ECS repull it.
+          # The image is also tagged with the commit SHA above so it's
+          # traceable, even though this service isn't pinned to that tag.
+          # A more production-grade version would register a new task
+          # definition revision pinned to the SHA tag instead (see
+          # aws-actions/amazon-ecs-render-task-definition /
+          # amazon-ecs-deploy-task-definition) - skipped here to keep this
+          # job minimal.
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment
