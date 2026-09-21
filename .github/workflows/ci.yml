@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, run stack, and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build production Docker image
+        run: docker build -t nexcell-app:${{ github.sha }} .
+
+      - name: Prepare environment file
+        run: cp .env.example .env
+
+      - name: Start docker-compose stack
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Run smoke tests
+        run: |
+          chmod +x smoke_test.sh
+          ./smoke_test.sh
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Clean up docker-compose stack
+        if: always()
+        run: docker compose down -v --remove-orphans
