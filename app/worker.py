@@ -15,7 +15,10 @@ def main() -> None:
     r = redis.from_url(REDIS_URL)
     print(f"Worker started, listening on queue '{QUEUE_NAME}'")
     while True:
-        item = r.blpop(QUEUE_NAME, timeout=5)
+        try:
+            item = r.blpop(QUEUE_NAME, timeout=5)
+        except redis.exceptions.TimeoutError:
+            continue
         if item is None:
             continue
         _, payload = item
